@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: ai-pod-linux-aarch64
             use_cross: true
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: ai-pod-macos-x86_64
           - os: macos-latest
