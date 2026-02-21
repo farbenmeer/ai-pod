@@ -12,9 +12,11 @@ RUN useradd -ms /bin/bash claude
 RUN chown -R claude /app
 USER claude
 
-
 ENV PATH="/home/claude/.local/bin:$PATH"
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+RUN git config --global user.email "claude@ai-pod"
+RUN git config --global user.name "claude"
 
 #RUN claude mcp add --transport http figma-desktop http://host.containers.internal:3845/mcp
 #RUN playwright-cli install --skills
