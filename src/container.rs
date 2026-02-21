@@ -332,10 +332,7 @@ mod tests {
     #[test]
     fn container_name_is_deterministic() {
         let path = Path::new("/home/user/myproject");
-        assert_eq!(
-            generate_container_name(path),
-            generate_container_name(path)
-        );
+        assert_eq!(generate_container_name(path), generate_container_name(path));
     }
 
     #[test]
@@ -426,11 +423,7 @@ mod tests {
 
         let claude_dir = config.home_dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
-            config.claude_md_path(),
-            "# My Rules\nAlways use Rust.\n",
-        )
-        .unwrap();
+        std::fs::write(config.claude_md_path(), "# My Rules\nAlways use Rust.\n").unwrap();
 
         generate_runtime_claude_md(&config).unwrap();
 
