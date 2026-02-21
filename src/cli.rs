@@ -20,7 +20,7 @@ pub struct Cli {
     pub workdir: Option<PathBuf>,
 
     /// Notification server port
-    #[arg(long, default_value = "9876")]
+    #[arg(long, default_value = "9876", global = true)]
     pub notify_port: u16,
 }
 
