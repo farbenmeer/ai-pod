@@ -76,7 +76,7 @@ fn launch_flow(cli: &Cli) -> Result<()> {
     server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
 
     // 6. Launch container
-    container::launch_container(&config, &workspace, cli.notify_port, cli.rebuild, &image)?;
+    container::launch_container(&config, &workspace, cli.notify_port, cli.rebuild, &image, &cli.ports)?;
 
     Ok(())
 }
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
             let image = image::image_name(&workspace);
             image::ensure_image(&config, &dockerfile, &image, cli.rebuild)?;
             server::lifecycle::ensure_server(&config.pid_file, &config.log_file, cli.notify_port)?;
-            container::run_in_container(&config, &workspace, cli.notify_port, command, args)?;
+            container::run_in_container(&config, &workspace, cli.notify_port, command, args, &cli.ports)?;
         }
         None => {
             launch_flow(&cli)?;
