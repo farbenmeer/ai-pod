@@ -1,6 +1,6 @@
 FROM rust:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git vim gh && rm -rf /var/lib/apt/lists/*
 
 ARG HOST_GATEWAY
 ARG AI_POD_VERSION
