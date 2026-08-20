@@ -571,7 +571,9 @@ fn refresh_claude_mcp_in_volume(
         anyhow::bail!("Failed to create mcp-refresh container");
     }
 
-    // Pull the existing .claude.json out of the volume (may not exist yet).
+    // Pull the existing .claude.json out of the volume (may not exist yet, so
+    // silence the runtime's "no such file" complaint — a missing config is the
+    // normal first-launch case and is handled by the empty-object default below).
     let tmp_in = config.config_dir.join("claude-in.json");
     let _ = std::fs::remove_file(&tmp_in);
     let _ = rt
@@ -581,6 +583,8 @@ fn refresh_claude_mcp_in_volume(
             &format!("{}:{}/.claude.json", init_container, CONTAINER_HOME),
             tmp_in.to_str().unwrap(),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     let mut value: serde_json::Value = std::fs::read_to_string(&tmp_in)
@@ -650,7 +654,9 @@ fn refresh_codex_config_in_volume(
         anyhow::bail!("Failed to create codex-refresh container");
     }
 
-    // Pull the existing config.toml out of the volume (may not exist yet).
+    // Pull the existing config.toml out of the volume (may not exist yet, so
+    // silence the runtime's "no such file" complaint — a missing config is the
+    // normal first-launch case and is handled by the empty-string default below).
     let tmp_in = config.config_dir.join("codex-config-in.toml");
     let _ = std::fs::remove_file(&tmp_in);
     let _ = rt
@@ -660,6 +666,8 @@ fn refresh_codex_config_in_volume(
             &format!("{}:{}/.codex/config.toml", init_container, CONTAINER_HOME),
             tmp_in.to_str().unwrap(),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     let existing = std::fs::read_to_string(&tmp_in).unwrap_or_default();
