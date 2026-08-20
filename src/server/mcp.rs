@@ -83,7 +83,7 @@ fn tool_error(text: String) -> Value {
 
 fn tools_definition(runtime: &ContainerRuntime) -> Value {
     let run_command_description = format!(
-        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling.\n\nOutput goes to `/app/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}` — these files live on THIS container's filesystem (the workspace is mounted at `/app`). Read them with your regular file Read tool, not via bash on the host. Re-Read `stdout`/`exit` to poll progress; you do not need to keep calling `command_status`.\n\nDo not start commands with `cd /`. Do not pipe to `| head`/`| tail` on the host — trim output in the container instead. Keep commands as simple as possible.",
+        "Run a shell command on the host (outside this container). From inside the container, reach host services via `{}` instead of `localhost`. Waits up to 5 seconds; returns the result inline if finished, otherwise returns a command_id for polling.\n\nOutput goes to `/app/.ai-pod/commands/{{session_id}}/{{command_id}}/{{stdout,stderr,exit}}` — these files live on THIS container's filesystem (the workspace is mounted at `/app`). Read them with your regular file Read tool, not via bash on the host. Re-Read `stdout`/`exit` to poll progress; you do not need to keep calling `command_status`.\n\nKeep the command simple: one command, plain arguments. Do not pipe, redirect, or chain — the full output is written to the files above anyway, so `| head`/`| tail` (rejected outright), `| grep`, `> file` and `2>&1` gain you nothing. Do not start commands with `cd /` either; commands already start in the workspace root. Load the `ai-pod` skill for the full rules.",
         runtime.host_gateway(),
     );
     json!([
@@ -107,7 +107,7 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
         },
         {
             "name": "stop_command",
-            "description": "Stop a running command (SIGTERM, then SIGKILL after 5s).",
+            "description": "Stop a running command (SIGTERM, then SIGKILL after 5s) — the whole process group, so use this instead of running `kill`/`pkill` on the host.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "command_id": { "type": "string" } },
@@ -122,6 +122,24 @@ fn tools_definition(runtime: &ContainerRuntime) -> Value {
                 "properties": {
                     "scope": { "type": "string", "enum": ["session", "workspace"] }
                 }
+            }
+        },
+        {
+            "name": "rebuild_image",
+            "description": "Rebuild this workspace's container image from `/app/ai-pod.Dockerfile` and, if the build succeeds, run `test_command` in a throwaway container of the fresh image so you can verify the tools you added are installed. The throwaway container is removed immediately and does NOT have the workspace mounted — test for tools, not for project builds.\n\nEdit `/app/ai-pod.Dockerfile` first; keep the agent install line, `WORKDIR /app`, the `ai-pod` user and the final `CMD` intact. Build log and test output go to `/app/.ai-pod/commands/{session_id}/{command_id}/{stdout,stderr,exit}` like any other command — read them with your file Read tool. A non-zero `exit` means the build or the test failed.\n\nThe running container is NOT changed: the new image is picked up the next time the user starts ai-pod. Use this instead of running `podman build`/`docker build` via run_command. See the `ai-pod` skill for the full workflow.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "test_command": {
+                        "type": "string",
+                        "description": "Shell command run in a throwaway container of the freshly built image, e.g. `node --version && npx playwright --version`."
+                    },
+                    "no_cache": {
+                        "type": "boolean",
+                        "description": "Build without the layer cache (default false). Slow — only when a cached layer is stale."
+                    }
+                },
+                "required": ["test_command"]
             }
         },
         {
@@ -251,6 +269,77 @@ pub async fn mcp_handler(
                 Json(rpc_error(id, -32601, &format!("Unknown method: {method}"))).into_response()
             }
         }
+    }
+}
+
+/// Rebuild the workspace image from its `ai-pod.Dockerfile`, then smoke-test
+/// the result in a throwaway container. Runs through the normal command runner
+/// so the (long) build log lands in the usual output files and the agent can
+/// poll or `stop_command` it like anything else.
+async fn handle_rebuild_image(
+    state: &AppState,
+    rt: &ContainerRuntime,
+    workspace: &std::path::Path,
+    session_id: &str,
+    args: &Value,
+) -> Value {
+    let test_command = match args.get("test_command").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            return tool_error(
+                "Missing `test_command` — pass a command that proves the tools you need are installed, e.g. `node --version`.".into(),
+            );
+        }
+    };
+    let no_cache = args
+        .get("no_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let dockerfile = workspace.join(crate::image::DOCKERFILE_NAME);
+    if !dockerfile.exists() {
+        return tool_error(format!(
+            "No {} in this workspace ({}). Create one with `ai-pod init` on the host first.",
+            crate::image::DOCKERFILE_NAME,
+            workspace.display()
+        ));
+    }
+    let image = crate::image::image_name(workspace);
+
+    match commands::run_rebuild_request(state, &image, workspace).await {
+        commands::ApprovalOutcome::Denied(reason) => return tool_error(reason.message().into()),
+        commands::ApprovalOutcome::Timeout => {
+            return tool_error("Permission request timed out after 60 seconds.".into());
+        }
+        commands::ApprovalOutcome::Rejected => {
+            return tool_error("Image rebuild rejected".into());
+        }
+        commands::ApprovalOutcome::Approved | commands::ApprovalOutcome::AlwaysAllow => {}
+    }
+
+    let cmd =
+        crate::image::rebuild_and_test_command(rt, &dockerfile, &image, no_cache, test_command);
+    match runner::spawn_and_wait(state, workspace, session_id, &cmd).await {
+        Ok(mut outcome) => {
+            let (s, e, x) = runner::container_paths(&outcome.session_id, &outcome.command_id);
+            outcome.stdout_path = s;
+            outcome.stderr_path = e;
+            outcome.exit_path = x;
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Rebuilding `{}` from {}; the test command runs in a throwaway container once the build succeeds. The image change takes effect the next time the user starts ai-pod.\n{}",
+                        image,
+                        crate::image::DOCKERFILE_NAME,
+                        serde_json::to_string_pretty(&outcome).unwrap_or_default()
+                    )
+                }],
+                "isError": false,
+                "structuredContent": outcome,
+            })
+        }
+        Err(e) => tool_error(format!("Failed to start rebuild: {e}")),
     }
 }
 
@@ -556,6 +645,66 @@ mod tests {
     }
 
     #[test]
+    fn tools_definition_includes_rebuild_image() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "rebuild_image")
+            .expect("rebuild_image tool must be advertised")["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("ai-pod.Dockerfile"),
+            "should name the Dockerfile it rebuilds, got: {desc}"
+        );
+        assert!(
+            desc.contains("throwaway container"),
+            "should explain where the test command runs, got: {desc}"
+        );
+        assert!(
+            desc.contains("next time"),
+            "should warn that the running container is unaffected, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn rebuild_image_requires_a_test_command() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let tool = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "rebuild_image")
+            .unwrap()
+            .clone();
+        assert_eq!(tool["inputSchema"]["required"][0], "test_command");
+    }
+
+    #[test]
+    fn run_command_description_forbids_output_shaping() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v[0]["description"].as_str().unwrap();
+        assert!(desc.contains("| head"), "got: {desc}");
+        assert!(desc.contains("Do not pipe"), "got: {desc}");
+    }
+
+    #[test]
+    fn stop_command_description_steers_away_from_host_kills() {
+        let v = tools_definition(&test_runtime(RuntimeKind::Podman));
+        let desc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "stop_command")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("pkill"), "got: {desc}");
+    }
+
+    #[test]
     fn tools_definition_includes_service_tools() {
         let v = tools_definition(&test_runtime(RuntimeKind::Podman));
         let names: Vec<&str> = v
@@ -732,6 +881,7 @@ async fn handle_tool_call(
                 "structuredContent": { "commands": cmds },
             })
         }
+        "rebuild_image" => handle_rebuild_image(state, rt, workspace, session_id, &args).await,
         "start_service" => handle_start_service(state, rt, workspace, session_id, &args).await,
         "stop_service" => handle_stop_service(rt, workspace, session_id, &args).await,
         "list_services" => handle_list_services(rt, workspace, session_id).await,

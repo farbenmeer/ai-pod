@@ -14,7 +14,8 @@ ai-pod manages per-workspace containers that run Claude Code, OpenCode, or OpenA
 - **Persistent agent state** — a named volume preserves `~/.claude`, `~/.config/opencode`, and `~/.codex` (login, memory, settings) across container restarts
 - **Credential scanning** — scans the workspace for secrets before mounting it; prompts you to review or abort
 - **Custom Dockerfiles per project** — drop an `ai-pod.Dockerfile` in any project to install extra runtimes, tools, or MCP servers
-- **AI-driven skill file** — container environment context and host-command usage are delivered via an auto-generated ai-pod skill loaded by Claude and OpenCode
+- **AI-driven skill file** — an `ai-pod` skill is written into every container so the agent can look up how the pod works (host commands, services, image rebuilds) on demand instead of carrying it in context
+- **Self-adjusting environment** — the agent can edit `ai-pod.Dockerfile` and verify it with the `rebuild_image` MCP tool, which rebuilds the image and smoke-tests it in a throwaway container
 - **Host command execution via MCP** — the in-container agent talks to the shared host server over MCP (`http://host.containers.internal:7822/mcp`); every host command requires your explicit approval with a persistent allowlist
 - **File-based command output** — every command writes stdout/stderr/exit to `{workspace}/.ai-pod/commands/{session_id}/{command_id}/` so the agent reads long-running output directly
 - **Interactive TUIs** — `ai-pod commands` to inspect/kill running host commands, `ai-pod allowed` to manage the whitelist
@@ -173,9 +174,40 @@ The default image is based on Ubuntu. The Dockerfile downloads the agent (Claude
 
 ---
 
+## The ai-pod skill
+
+Every container gets an `ai-pod` skill written into the home volume, at
+`~/.claude/skills/ai-pod/SKILL.md` (read by Claude Code and OpenCode) and
+`~/.codex/skills/ai-pod/SKILL.md` (read by Codex). It is refreshed on every
+launch, so upgrading ai-pod updates the instructions in existing volumes.
+
+Agents load a skill on demand, so the guidance costs nothing until the agent
+actually needs it. It covers:
+
+- **Where the agent is** — workspace at `/app`, a persistent `$HOME` volume,
+  everything else ephemeral, the host at `host.containers.internal` /
+  `host.docker.internal`.
+- **How to run host commands** — prefer the container; keep the command simple;
+  never pipe, redirect, or chain just to shape output, because the full streams
+  are already written to files the agent can read; don't `cd` to an absolute
+  path; reuse command strings verbatim so the user's allowlist keeps matching.
+- **How to stop them** — `stop_command` with the `command_id`, never `kill`,
+  `pkill` or `killall` on the host: those guess at pids on the user's machine
+  and can take out their editor, their dev server, or the session itself.
+- **Service containers** — reach for `start_service` instead of installing a
+  database into the pod.
+- **How to change the image** — edit `ai-pod.Dockerfile`, what must stay intact,
+  and how to verify the result with `rebuild_image`.
+
+Bind-mounting your own skills directory over the container's (e.g.
+`ai-pod mount add ~/.claude/skills`) hides the injected copy; ai-pod prints a
+warning at launch when a mount does that.
+
+---
+
 ## Host interaction
 
-The in-container agent talks to the host through an **MCP server** running on the shared ai-pod host server (`http://host.containers.internal:7822/mcp`, or `host.docker.internal` on Docker). No CLI binary is shipped into the container — host interaction happens entirely through MCP tools, taught to the agent via the auto-generated ai-pod skill.
+The in-container agent talks to the host through an **MCP server** running on the shared ai-pod host server (`http://host.containers.internal:7822/mcp`, or `host.docker.internal` on Docker). No CLI binary is shipped into the container — host interaction happens entirely through MCP tools, taught to the agent via the injected [ai-pod skill](#the-ai-pod-skill).
 
 ### MCP tools
 
@@ -185,12 +217,37 @@ The in-container agent talks to the host through an **MCP server** running on th
 | `command_status` | Check the status of a previously started command. Returns running/finished/killed plus the last 10 lines of stdout/stderr. |
 | `stop_command` | Stop a running command (SIGTERM, then SIGKILL after 5 s). |
 | `list_commands` | List commands for this session (or workspace-wide with `scope=workspace`). |
+| `rebuild_image` | Rebuild the workspace image from `ai-pod.Dockerfile` and run a test command in a throwaway container of the result. |
 | `notify_user` | Send a desktop notification to the host user. |
 | `list_allowed_commands` | List host commands previously approved by the user for this workspace. |
 | `start_service` | Start an auxiliary service container (e.g. `postgres:16`) reachable from inside the agent container. |
 | `stop_service` | Stop and remove a service container started by this session. |
 | `list_services` | List service containers started by this session. |
 | `service_logs` | Read the tail of a service container's logs. |
+
+### Rebuilding the image from inside the pod
+
+The agent can adjust its own environment: it edits `/app/ai-pod.Dockerfile` and
+then calls `rebuild_image` with a `test_command`.
+
+```jsonc
+{ "test_command": "node --version && npx playwright --version" }
+```
+
+The tool rebuilds the workspace image with the same build args and context the
+CLI uses and, **only if the build succeeds**, runs `test_command` in a throwaway
+container of the fresh image (`--rm`, no workspace mount) so the agent can prove
+the tools it added are installed and on `PATH`. Build log and test output stream
+to the usual command output files, so a long build is polled by re-reading
+`stdout` rather than by blocking.
+
+Rebuilds are approved like everything else, with their own per-workspace
+allowlist entry (`rebuild image <image> from ai-pod.Dockerfile`) that is
+independent of the test command — so approving once lets the agent iterate on
+its Dockerfile, and each rebuild is still just a container build on your machine.
+
+The **running container is not affected**: the new image is picked up the next
+time you start ai-pod.
 
 ### Service containers
 
@@ -286,6 +343,13 @@ The symlink target is outside the mount — the container never sees the actual 
 ### Host command approval
 
 Claude can only run host commands you have explicitly approved via the interactive prompt. Approved commands are persisted per-workspace so you only approve each one once. The MCP server pre-rejects obviously dangerous patterns (e.g. starting with `cd /`, piping to `| head`/`| tail`) before they reach the approval dialog.
+
+Service starts and image rebuilds are approved the same way, in their own
+per-workspace buckets: a service is keyed by image plus the sorted list of
+env-var KEY names, a rebuild by the image name. Approving one never implies the
+others — an always-allowed `make build` does not let the agent rebuild its
+image, and an always-allowed rebuild does not let it run arbitrary host
+commands.
 
 ---
 

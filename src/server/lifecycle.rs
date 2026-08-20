@@ -42,6 +42,10 @@ pub struct ProjectState {
     /// `start_service` requests. See `commands::service_approval_key`.
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    /// Image names the user has approved for `rebuild_image` requests. See
+    /// `commands::rebuild_approval_key`.
+    #[serde(default)]
+    pub allowed_rebuilds: Vec<String>,
 }
 
 impl ProjectState {
@@ -119,6 +123,16 @@ impl ProjectState {
     pub fn add_allowed_service(&mut self, key: &str) {
         if !self.is_service_allowed(key) {
             self.allowed_services.push(key.to_string());
+        }
+    }
+
+    pub fn is_rebuild_allowed(&self, key: &str) -> bool {
+        self.allowed_rebuilds.iter().any(|k| k == key)
+    }
+
+    pub fn add_allowed_rebuild(&mut self, key: &str) {
+        if !self.is_rebuild_allowed(key) {
+            self.allowed_rebuilds.push(key.to_string());
         }
     }
 }
@@ -376,6 +390,7 @@ mod tests {
             ignored_credential_files: vec![],
             masked_directories: vec![],
             allowed_services: vec![],
+            allowed_rebuilds: vec![],
         };
         state.save(&path).unwrap();
         let perms = std::fs::metadata(&path).unwrap().permissions();
@@ -411,6 +426,7 @@ mod tests {
             ignored_credential_files: vec![],
             masked_directories: vec![],
             allowed_services: vec![],
+            allowed_rebuilds: vec![],
         };
         state.save(&path).unwrap();
         let loaded = ProjectState::load(&path);

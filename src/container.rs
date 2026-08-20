@@ -192,6 +192,17 @@ pub(crate) fn build_mount_args(home_dir: &Path, mounts: &[MountSpec]) -> Result<
             );
             continue;
         }
+        // A mount over a skills directory hides the ai-pod skill ai-pod writes
+        // into the home volume, leaving the agent without the host-interaction
+        // instructions. Benign enough to allow, noisy enough to say so.
+        if let Some(skill) = crate::skill::shadowed_path(CONTAINER_HOME, &target) {
+            eprintln!(
+                "{} mount {} hides the injected ai-pod skill at {}; the agent will not see it",
+                "warning:".yellow().bold(),
+                target,
+                skill
+            );
+        }
         let opts = if m.writable { "z" } else { "z,ro" };
         out.push("-v".to_string());
         out.push(format!("{}:{}:{}", m.host, target, opts));
@@ -690,6 +701,72 @@ fn refresh_codex_config_in_volume(
     Ok(())
 }
 
+/// Write the `ai-pod` agent skill into the home volume.
+///
+/// Runs on every launch (not just on seed) so an ai-pod upgrade refreshes the
+/// instructions in long-lived volumes, mirroring the MCP-config refreshes
+/// above. The file is dropped into every agent's global skills directory; the
+/// agent loads it on demand instead of carrying the guidance in its context.
+pub fn refresh_skill_in_volume(
+    rt: &ContainerRuntime,
+    config: &AppConfig,
+    volume_name: &str,
+    container_name: &str,
+    image: &str,
+) -> Result<()> {
+    let skill_file = config.config_dir.join("ai-pod-skill.md");
+    std::fs::write(&skill_file, crate::skill::render(rt))
+        .context("Failed to render ai-pod skill")?;
+
+    let mut mkdir = rt.command();
+    mkdir.args([
+        "run",
+        "--rm",
+        "-v",
+        &format!("{}:{}:z", volume_name, CONTAINER_HOME),
+        image,
+        "mkdir",
+        "-p",
+    ]);
+    for dir in crate::skill::skill_dirs(CONTAINER_HOME) {
+        mkdir.arg(dir);
+    }
+    let _ = mkdir.status();
+
+    let init_container = format!("{}-skill", container_name);
+    let status = rt
+        .command()
+        .args([
+            "create",
+            "--name",
+            &init_container,
+            "-v",
+            &format!("{}:{}", volume_name, CONTAINER_HOME),
+            image,
+            "true",
+        ])
+        .status()
+        .context("Failed to create skill-refresh container")?;
+    if !status.success() {
+        anyhow::bail!("Failed to create skill-refresh container");
+    }
+
+    for path in crate::skill::skill_paths(CONTAINER_HOME) {
+        let _ = rt
+            .command()
+            .args([
+                "cp",
+                &skill_file.to_string_lossy(),
+                &format!("{}:{}", init_container, path),
+            ])
+            .status();
+    }
+
+    let _ = rt.command().args(["rm", &init_container]).status();
+    let _ = std::fs::remove_file(&skill_file);
+    Ok(())
+}
+
 /// Initialize a named home volume for the first time.
 fn init_home_volume(
     rt: &ContainerRuntime,
@@ -831,6 +908,8 @@ pub fn launch_container(
         &session_id,
     )?;
 
+    refresh_skill_in_volume(rt, config, &volume_name, &prefix, image)?;
+
     let add_host = rt.add_host_arg();
     let host_gw_env = format!("HOST_GATEWAY={}", rt.host_gateway());
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
@@ -961,6 +1040,8 @@ pub fn run_in_container(
         api_key,
         &session_id,
     )?;
+
+    refresh_skill_in_volume(rt, config, &volume_name, &container_name, image)?;
 
     eprintln!(
         "{} {} {}",

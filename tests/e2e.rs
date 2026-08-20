@@ -468,6 +468,143 @@ fn e2e_container_workdir_is_app() {
     );
 }
 
+/// True when the runtime has an image with this tag. Uses `image inspect`,
+/// which both docker and podman implement (unlike `image exists`).
+fn image_present(rt: &ContainerRuntime, tag: &str) -> bool {
+    rt.command()
+        .args(["image", "inspect", tag])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `container::refresh_skill_in_volume` drops the ai-pod skill into every
+/// agent's global skills directory inside the home volume.
+#[test]
+fn e2e_skill_is_written_into_home_volume() {
+    let rt = require_runtime!();
+    let tag = shared_image_tag(&rt);
+    let (_dir, config) = make_test_config();
+    let ws = tempfile::TempDir::new().unwrap();
+    let vol = workspace::volume_name(ws.path());
+    let prefix = workspace::container_prefix(ws.path());
+
+    cleanup_volume(&rt, &vol);
+    let created = rt
+        .command()
+        .args(["volume", "create", &vol])
+        .status()
+        .unwrap();
+    assert!(created.success());
+
+    container::refresh_skill_in_volume(&rt, &config, &vol, &prefix, tag).expect("install skill");
+
+    for path in ai_pod::skill::skill_paths("/home/ai-pod") {
+        let output = rt
+            .command()
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{}:/home/ai-pod", vol),
+                tag,
+                "cat",
+                &path,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "skill missing at {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            body.starts_with("---\n"),
+            "skill at {path} lost its frontmatter"
+        );
+        assert!(body.contains("name: ai-pod"));
+        assert!(body.contains("rebuild_image"));
+        assert!(!body.contains("{{"), "unsubstituted placeholder in {path}");
+    }
+
+    // Re-running overwrites in place rather than failing on the existing file.
+    container::refresh_skill_in_volume(&rt, &config, &vol, &prefix, tag).expect("reinstall skill");
+
+    cleanup_volume(&rt, &vol);
+}
+
+/// The shell command behind the `rebuild_image` MCP tool really builds the
+/// workspace image and then runs the test command in a throwaway container.
+#[test]
+fn e2e_rebuild_and_test_command_builds_then_tests() {
+    let rt = require_runtime!();
+    let (ws, dockerfile) = make_test_workspace();
+    let tag = "ai-pod-e2e-rebuild:test";
+    cleanup_image(&rt, tag);
+
+    let cmd = image::rebuild_and_test_command(&rt, &dockerfile, tag, false, "git --version");
+    let output = std::process::Command::new("sh")
+        .args(["-c", &cmd])
+        .current_dir(ws.path())
+        .output()
+        .expect("run rebuild command");
+
+    assert!(
+        output.status.success(),
+        "rebuild+test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("git version"),
+        "test command output missing: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The image the agent's next session would use now exists.
+    assert!(
+        image_present(&rt, tag),
+        "rebuild should leave the image behind"
+    );
+
+    cleanup_image(&rt, tag);
+}
+
+/// A failing test command surfaces as a non-zero exit even though the build
+/// itself succeeded — that is how the agent learns its tool is missing.
+#[test]
+fn e2e_rebuild_and_test_command_fails_when_tool_is_missing() {
+    let rt = require_runtime!();
+    let (ws, dockerfile) = make_test_workspace();
+    let tag = "ai-pod-e2e-rebuild-fail:test";
+    cleanup_image(&rt, tag);
+
+    let cmd = image::rebuild_and_test_command(
+        &rt,
+        &dockerfile,
+        tag,
+        false,
+        "definitely-not-installed --version",
+    );
+    let output = std::process::Command::new("sh")
+        .args(["-c", &cmd])
+        .current_dir(ws.path())
+        .output()
+        .expect("run rebuild command");
+
+    assert!(
+        !output.status.success(),
+        "missing tool should fail the test"
+    );
+    // Build succeeded, so the image is there; only the smoke test failed.
+    assert!(
+        image_present(&rt, tag),
+        "the build itself should have succeeded"
+    );
+
+    cleanup_image(&rt, tag);
+}
+
 // ---------------------------------------------------------------------------
 // Async helpers
 // ---------------------------------------------------------------------------

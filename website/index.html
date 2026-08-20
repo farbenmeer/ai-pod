@@ -759,6 +759,31 @@
                     </div>
 
                     <div class="feature-card">
+                        <div class="feature-icon">📘</div>
+                        <h3>Injected ai-pod skill</h3>
+                        <p>
+                            Every container ships with an <code>ai-pod</code>
+                            skill the agent loads on demand: how to run host
+                            commands (simple, unpiped — the output is already in
+                            files it can read), how to stop them without
+                            reaching for <code>pkill</code>, and how the pod is
+                            wired together.
+                        </p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">🧱</div>
+                        <h3>Self-adjusting environment</h3>
+                        <p>
+                            Missing a tool? The agent edits
+                            <code>ai-pod.Dockerfile</code> and calls
+                            <code>rebuild_image</code>, which rebuilds the image
+                            and runs its test command in a throwaway container —
+                            so it can prove the fix before you restart the pod.
+                        </p>
+                    </div>
+
+                    <div class="feature-card">
                         <div class="feature-icon">⚡</div>
                         <h3>On-demand service containers</h3>
                         <p>

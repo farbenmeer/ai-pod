@@ -28,4 +28,9 @@ git init -q "$WORK"
 # shellcheck disable=SC2086
 ai-pod --workdir "$WORK" --no-credential-check run $VERIFY_ARGS
 
+# The ai-pod skill must be seeded into the home volume so the agent can look up
+# how to reach the host, stop commands, and rebuild its own image.
+ai-pod --workdir "$WORK" --no-credential-check run \
+  cat /home/ai-pod/.claude/skills/ai-pod/SKILL.md | grep -q "^name: ai-pod$"
+
 echo "PASS: ${COMBO}"
