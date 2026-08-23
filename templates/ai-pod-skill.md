@@ -1,6 +1,6 @@
 ---
 name: ai-pod
-description: How to work inside an ai-pod container — running commands on the host with the ai-pod MCP tools, reading their output files, stopping them with stop_command, starting service containers, and changing the container image by editing {{DOCKERFILE}} and calling rebuild_image. Use whenever something has to run on the host, a host command hangs or has to be stopped, a tool or runtime is missing from this container, or the user asks about ai-pod itself.
+description: How to work inside an ai-pod container — running commands on the host and adjusting the container environment.
 ---
 
 # Working inside an ai-pod
@@ -14,10 +14,10 @@ container runtime itself) is reachable only through the `ai-pod` MCP server.
 - **The workspace is mounted at `/app`.** Files you write there land on the
   user's real filesystem. `/app` is where you do normal work.
 - **`$HOME` is a persistent volume.** Agent config and login survive restarts.
-  It is *not* the user's home directory.
+  It is _not_ the user's home directory.
 - **Everything else in the container is ephemeral.** Packages you install at
   runtime disappear when the session ends. To make a tool permanent, edit
-  `{{DOCKERFILE}}` (see *Changing this container* below).
+  `{{DOCKERFILE}}` (see _Changing this container_ below).
 - **The host is `{{HOST_GATEWAY}}`, not `localhost`.** A dev server the user
   runs on their machine is at `{{HOST_GATEWAY}}:<port>` from in here.
 
@@ -36,8 +36,8 @@ Rules, in order of how often they matter:
    pipelines, do not redirect, do not chain with `&&` or `;`, and do not wrap
    things in `bash -c "..."` to shape the output.
 3. **Never trim output on the host.** stdout and stderr are captured to files
-   you can read in full (see below), so `| head`, `| tail`, `| grep`, `> file`
-   and `2>&1` buy you nothing — `| head` and `| tail` are rejected outright.
+   you can read in full (see below), so `| head`, `| tail`, `| grep` and `> file`
+   buy you nothing — `| head` and `| tail` are rejected outright.
    Run the plain command and read as much of the output file as you need.
 4. **Don't `cd` to an absolute path first.** Host commands already start in the
    workspace root, and a leading `cd /…` is rejected. A relative `cd sub && …`
@@ -57,7 +57,7 @@ Rules, in order of how often they matter:
 /app/.ai-pod/commands/{session_id}/{command_id}/exit
 ```
 
-These are files in *this* container (the workspace is mounted at `/app`), so
+These are files in _this_ container (the workspace is mounted at `/app`), so
 read them with your normal file Read tool — not with a host command. Re-read
 `stdout` to follow progress and `exit` to see whether it is done: it contains
 the decimal exit code, or `killed`. `command_status` is there for a quick
@@ -101,7 +101,7 @@ Keep these intact:
 - `WORKDIR /app`, the `ai-pod` user creation, `USER ai-pod`, and the final
   `CMD`.
 
-Put root-level installs (`apt-get install …`, toolchains) *before* the
+Put root-level installs (`apt-get install …`, toolchains) _before_ the
 `USER ai-pod` line and user-level installs after it.
 
 Then verify with the `rebuild_image` MCP tool:
