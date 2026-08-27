@@ -271,6 +271,8 @@ When a host command isn't on the allowlist, the agent's request triggers an appr
 
 Before mounting your workspace, ai-pod scans for common credential files (`.env`, SSH keys, API token files, etc.) and prompts you to continue or abort. Pass `--no-credential-check` to skip this if you know the workspace is clean.
 
+Detection is regex-based, so any `.env` variant is matched — `.env.local`, `.env.dev`, `.env.whatever`. Templates like `.env.example` match too; pick "keep in workspace, suppress future warnings" once and they won't be reported again for that project.
+
 ### Keeping .env files out of the container
 
 Move your `.env` file outside the workspace and symlink it back:
