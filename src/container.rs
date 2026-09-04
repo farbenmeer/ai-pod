@@ -304,11 +304,41 @@ fn claude_mcp_entry(server_url: &str, api_key: &str, session_id: &str) -> serde_
     })
 }
 
+/// MCP server entry for the host-side Playwright server, as consumed by Claude
+/// Code and OpenCode. The url points at the runtime's host gateway; the
+/// spoofed `Host` header satisfies Playwright MCP's host allow-list (see
+/// [`crate::playwright`]).
+fn playwright_mcp_entry(host_gateway: &str, opencode: bool) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "type": if opencode { "remote" } else { "http" },
+        "url": crate::playwright::mcp_url(host_gateway),
+        "headers": {
+            "Host": crate::playwright::host_header(),
+        }
+    });
+    if opencode {
+        entry["enabled"] = serde_json::Value::Bool(true);
+    }
+    entry
+}
+
+/// Whether an existing MCP entry is one ai-pod wrote for the host-side
+/// Playwright server. Guards removal so a user's own `playwright` entry
+/// (pointing somewhere else) is never deleted.
+fn is_ai_pod_playwright_entry(entry: &serde_json::Value, host_gateway: &str) -> bool {
+    entry["url"].as_str() == Some(crate::playwright::mcp_url(host_gateway).as_str())
+}
+
 /// Full inline config injected into OpenCode via the `OPENCODE_CONFIG_CONTENT`
 /// env var. Since the env var is set per-launch, we can bake the literal
 /// values in directly — no interpolation needed.
-fn opencode_config_content(server_url: &str, api_key: &str, session_id: &str) -> String {
-    serde_json::to_string(&serde_json::json!({
+fn opencode_config_content(
+    server_url: &str,
+    api_key: &str,
+    session_id: &str,
+    playwright: Option<&str>,
+) -> String {
+    let mut value = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "mcp": {
             "ai-pod": {
@@ -321,8 +351,13 @@ fn opencode_config_content(server_url: &str, api_key: &str, session_id: &str) ->
                 }
             }
         }
-    }))
-    .expect("serialize opencode config content")
+    });
+    // The env var is rebuilt on every launch, so omitting the entry is all
+    // that's needed to disable Playwright for a run without `--playwright`.
+    if let Some(host_gateway) = playwright {
+        value["mcp"]["playwright"] = playwright_mcp_entry(host_gateway, true);
+    }
+    serde_json::to_string(&value).expect("serialize opencode config content")
 }
 
 /// Merge ai-pod's keys into a Codex `config.toml`, preserving everything else.
@@ -344,6 +379,7 @@ fn codex_config_merge(
     server_url: &str,
     api_key: &str,
     session_id: &str,
+    playwright: Option<&str>,
 ) -> String {
     // Missing OR unparsable config -> start from an empty document.
     let mut doc = existing
@@ -364,7 +400,38 @@ fn codex_config_merge(
     server["http_headers"]["X-Api-Key"] = toml_edit::value(api_key);
     server["http_headers"]["X-Ai-Pod-Session-Id"] = toml_edit::value(session_id);
 
+    // `~/.codex/config.toml` persists in the home volume, so a run without
+    // `--playwright` has to actively remove the entry we wrote earlier.
+    match playwright {
+        Some(host_gateway) => {
+            let pw = &mut doc["mcp_servers"]["playwright"];
+            pw["url"] = toml_edit::value(crate::playwright::mcp_url(host_gateway));
+            pw["http_headers"]["Host"] = toml_edit::value(crate::playwright::host_header());
+        }
+        None => remove_codex_playwright(&mut doc),
+    }
+
     doc.to_string()
+}
+
+/// Drop `[mcp_servers.playwright]` from a Codex config, but only when it is
+/// the entry ai-pod wrote (url pointing at a container-runtime host gateway).
+/// A user's own `playwright` server is left alone.
+fn remove_codex_playwright(doc: &mut toml_edit::DocumentMut) {
+    let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) else {
+        return;
+    };
+    let ours = servers
+        .get("playwright")
+        .and_then(|pw| pw.get("url"))
+        .and_then(|u| u.as_str())
+        .is_some_and(|url| {
+            url == crate::playwright::mcp_url("host.containers.internal")
+                || url == crate::playwright::mcp_url("host.docker.internal")
+        });
+    if ours {
+        servers.remove("playwright");
+    }
 }
 
 fn read_git_global(key: &str) -> Option<String> {
@@ -540,6 +607,27 @@ fn seed_home_volume(
     Ok(())
 }
 
+/// Insert or remove the `playwright` MCP entry in a JSON map of MCP servers.
+/// Removal only touches an entry ai-pod itself wrote (see
+/// [`is_ai_pod_playwright_entry`]).
+fn apply_playwright_entry(
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+    host_gateway: &str,
+    enabled: bool,
+) {
+    if enabled {
+        servers.insert(
+            "playwright".to_string(),
+            playwright_mcp_entry(host_gateway, false),
+        );
+    } else if servers
+        .get("playwright")
+        .is_some_and(|e| is_ai_pod_playwright_entry(e, host_gateway))
+    {
+        servers.remove("playwright");
+    }
+}
+
 /// Update the `mcpServers.ai-pod` entry in the volume's `~/.claude.json`
 /// with literal api_key + session_id values. Runs on every launch so the
 /// in-volume config matches the env the agent will see.
@@ -552,6 +640,7 @@ fn refresh_claude_mcp_in_volume(
     server_url: &str,
     api_key: &str,
     session_id: &str,
+    playwright: bool,
 ) -> Result<()> {
     let init_container = format!("{}-mcp", container_name);
     let status = rt
@@ -597,13 +686,16 @@ fn refresh_claude_mcp_in_volume(
     let servers = obj
         .entry("mcpServers".to_string())
         .or_insert_with(|| serde_json::json!({}));
-    servers
+    let servers = servers
         .as_object_mut()
-        .expect("mcpServers must be an object")
-        .insert(
-            "ai-pod".to_string(),
-            claude_mcp_entry(server_url, api_key, session_id),
-        );
+        .expect("mcpServers must be an object");
+    servers.insert(
+        "ai-pod".to_string(),
+        claude_mcp_entry(server_url, api_key, session_id),
+    );
+    // `~/.claude.json` persists in the home volume, so the entry has to be
+    // removed again on a launch without `--playwright`.
+    apply_playwright_entry(servers, rt.host_gateway(), playwright);
 
     let tmp_out = config.config_dir.join("claude-out.json");
     std::fs::write(&tmp_out, serde_json::to_string_pretty(&value)?)?;
@@ -635,6 +727,7 @@ fn refresh_codex_config_in_volume(
     server_url: &str,
     api_key: &str,
     session_id: &str,
+    playwright: bool,
 ) -> Result<()> {
     let init_container = format!("{}-codex", container_name);
     let status = rt
@@ -671,7 +764,13 @@ fn refresh_codex_config_in_volume(
         .status();
 
     let existing = std::fs::read_to_string(&tmp_in).unwrap_or_default();
-    let merged = codex_config_merge(&existing, server_url, api_key, session_id);
+    let merged = codex_config_merge(
+        &existing,
+        server_url,
+        api_key,
+        session_id,
+        playwright.then(|| rt.host_gateway()),
+    );
 
     let tmp_out = config.config_dir.join("codex-config-out.toml");
     std::fs::write(&tmp_out, merged)?;
@@ -758,6 +857,7 @@ pub fn launch_container(
     image: &str,
     project_id: &str,
     api_key: &str,
+    playwright: bool,
 ) -> Result<()> {
     let prefix = container_prefix(workspace);
     let volume_name = gen_volume_name(workspace);
@@ -818,6 +918,7 @@ pub fn launch_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        playwright,
     )?;
 
     refresh_codex_config_in_volume(
@@ -829,6 +930,7 @@ pub fn launch_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        playwright,
     )?;
 
     let add_host = rt.add_host_arg();
@@ -836,7 +938,12 @@ pub fn launch_container(
     let server_url_env = format!("AI_POD_SERVER_URL={}", rt.server_url());
     let opencode_config_env = format!(
         "OPENCODE_CONFIG_CONTENT={}",
-        opencode_config_content(&rt.server_url(), api_key, &session_id)
+        opencode_config_content(
+            &rt.server_url(),
+            api_key,
+            &session_id,
+            playwright.then(|| rt.host_gateway()),
+        )
     );
 
     let project_state = load_project_state(config, workspace);
@@ -915,6 +1022,7 @@ pub fn run_in_container(
     command: &str,
     args: &[String],
     interactive: bool,
+    playwright: bool,
 ) -> Result<()> {
     let session_id = new_session_id();
     let container_name = container_name_for(workspace, &session_id);
@@ -949,6 +1057,7 @@ pub fn run_in_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        playwright,
     )?;
 
     refresh_codex_config_in_volume(
@@ -960,6 +1069,7 @@ pub fn run_in_container(
         &rt.server_url(),
         api_key,
         &session_id,
+        playwright,
     )?;
 
     eprintln!(
@@ -1015,7 +1125,12 @@ pub fn run_in_container(
         "-e".into(),
         format!(
             "OPENCODE_CONFIG_CONTENT={}",
-            opencode_config_content(&rt.server_url(), api_key, &session_id)
+            opencode_config_content(
+            &rt.server_url(),
+            api_key,
+            &session_id,
+            playwright.then(|| rt.host_gateway()),
+        )
         ),
         "--entrypoint".into(),
         command.to_string(),
@@ -1274,7 +1389,7 @@ mod tests {
 
     #[test]
     fn opencode_config_content_bakes_literal_values() {
-        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2");
+        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2", None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mcp"]["ai-pod"]["type"], "remote");
         assert_eq!(
@@ -1287,12 +1402,117 @@ mod tests {
     }
 
     #[test]
+    fn opencode_config_includes_playwright_when_enabled() {
+        let s = opencode_config_content(
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+            Some("host.containers.internal"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mcp"]["playwright"]["type"], "remote");
+        assert_eq!(v["mcp"]["playwright"]["enabled"], true);
+        assert_eq!(
+            v["mcp"]["playwright"]["url"],
+            "http://host.containers.internal:8931/mcp"
+        );
+        assert_eq!(v["mcp"]["playwright"]["headers"]["Host"], "localhost:8931");
+    }
+
+    #[test]
+    fn opencode_config_omits_playwright_when_disabled() {
+        let s = opencode_config_content("http://host.containers.internal:7822", "k1", "s2", None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["mcp"]["playwright"].is_null());
+    }
+
+    #[test]
+    fn claude_playwright_entry_is_added_and_removed() {
+        let mut servers = serde_json::Map::new();
+        apply_playwright_entry(&mut servers, "host.containers.internal", true);
+        let entry = &servers["playwright"];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://host.containers.internal:8931/mcp");
+        assert_eq!(entry["headers"]["Host"], "localhost:8931");
+        // OpenCode's `enabled` key is not part of the Claude entry.
+        assert!(entry["enabled"].is_null());
+
+        apply_playwright_entry(&mut servers, "host.containers.internal", false);
+        assert!(!servers.contains_key("playwright"));
+    }
+
+    #[test]
+    fn claude_keeps_a_user_defined_playwright_entry() {
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            "playwright".to_string(),
+            serde_json::json!({"type": "http", "url": "http://example.test/mcp"}),
+        );
+        apply_playwright_entry(&mut servers, "host.containers.internal", false);
+        assert_eq!(
+            servers["playwright"]["url"], "http://example.test/mcp",
+            "a playwright entry ai-pod did not write must survive"
+        );
+    }
+
+    #[test]
+    fn codex_config_adds_and_removes_playwright() {
+        let with_pw = codex_config_merge(
+            "",
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+            Some("host.containers.internal"),
+        );
+        let doc = with_pw.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["playwright"]["url"].as_str(),
+            Some("http://host.containers.internal:8931/mcp")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["playwright"]["http_headers"]["Host"].as_str(),
+            Some("localhost:8931")
+        );
+
+        // A later launch without --playwright must drop the entry again while
+        // leaving ai-pod's own server intact.
+        let without = codex_config_merge(
+            &with_pw,
+            "http://host.containers.internal:7822",
+            "k1",
+            "s3",
+            None,
+        );
+        let doc = without.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(doc["mcp_servers"].get("playwright").is_none());
+        assert!(doc["mcp_servers"].get("ai-pod").is_some());
+    }
+
+    #[test]
+    fn codex_config_keeps_a_user_defined_playwright_entry() {
+        let existing = "[mcp_servers.playwright]\nurl = \"http://example.test/mcp\"\n";
+        let out = codex_config_merge(
+            existing,
+            "http://host.containers.internal:7822",
+            "k1",
+            "s2",
+            None,
+        );
+        let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["playwright"]["url"].as_str(),
+            Some("http://example.test/mcp")
+        );
+    }
+
+    #[test]
     fn codex_config_merge_into_empty() {
         let out = codex_config_merge(
             "",
             "http://host.containers.internal:7822",
             "k1",
             "s2",
+            None,
         );
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["experimental_use_rmcp_client"].as_bool(), Some(true));
@@ -1322,6 +1542,7 @@ mod tests {
             "http://host.containers.internal:7822",
             "k1",
             "s2",
+            None,
         );
         // The user's key and comment survive (toml_edit, not a typed rewrite).
         assert!(out.contains("# my comment"), "comment should survive: {out}");
@@ -1338,7 +1559,7 @@ mod tests {
     fn codex_config_merge_url_uses_runtime_gateway() {
         // On Docker the gateway is host.docker.internal — the url must reflect
         // whatever server_url is passed, not a hardcoded host.
-        let out = codex_config_merge("", "http://host.docker.internal:7822", "k1", "s2");
+        let out = codex_config_merge("", "http://host.docker.internal:7822", "k1", "s2", None);
         let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(
             doc["mcp_servers"]["ai-pod"]["url"].as_str(),
@@ -1348,8 +1569,8 @@ mod tests {
 
     #[test]
     fn codex_config_merge_overwrites_stale_session() {
-        let first = codex_config_merge("", "http://h:7822", "k1", "old-session");
-        let second = codex_config_merge(&first, "http://h:7822", "k2", "new-session");
+        let first = codex_config_merge("", "http://h:7822", "k1", "old-session", None);
+        let second = codex_config_merge(&first, "http://h:7822", "k2", "new-session", None);
         let doc = second.parse::<toml_edit::DocumentMut>().unwrap();
         let server = &doc["mcp_servers"]["ai-pod"];
         assert_eq!(server["http_headers"]["X-Api-Key"].as_str(), Some("k2"));

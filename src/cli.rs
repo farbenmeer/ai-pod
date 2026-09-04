@@ -46,6 +46,12 @@ pub struct Cli {
     /// Container runtime to use (overrides AI_POD_RUNTIME and autodetect)
     #[arg(long, value_enum)]
     pub runtime: Option<crate::runtime::RuntimeKind>,
+
+    /// Start Playwright MCP on the host and expose it to the agent in the
+    /// container, so it drives a real browser with your own logins.
+    /// Without this flag the Playwright MCP entry is removed again.
+    #[arg(long)]
+    pub playwright: bool,
 }
 
 #[derive(Subcommand)]

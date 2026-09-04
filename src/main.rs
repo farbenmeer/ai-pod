@@ -1,6 +1,6 @@
 use ai_pod::{
-    cli, commands_cli, config, container, credentials, env_files_cli, image, mount_cli, runtime,
-    server, services_cli, update, workspace,
+    cli, commands_cli, config, container, credentials, env_files_cli, image, mount_cli, playwright,
+    runtime, server, services_cli, update, workspace,
 };
 
 use anyhow::{Context, Result};
@@ -281,8 +281,16 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
     // 8. Reload server config so it picks up the updated project file
     server::lifecycle::reload_config().await?;
 
-    // 9. Launch container
-    container::launch_container(
+    // 9. Start Playwright MCP on the host, if requested. Done last so a
+    //    failure here doesn't leave a half-built launch behind.
+    let pw = if cli.playwright {
+        Some(playwright::ensure_running(&config)?)
+    } else {
+        None
+    };
+
+    // 10. Launch container
+    let result = container::launch_container(
         rt,
         &config,
         &workspace,
@@ -290,9 +298,16 @@ async fn launch_flow(cli: &Cli, rt: &ContainerRuntime) -> Result<()> {
         &image,
         &project_id,
         &state.api_key,
-    )?;
+        cli.playwright,
+    );
 
-    Ok(())
+    // The host-side browser server is only useful for the session that asked
+    // for it; stop it again unless another session already owned it.
+    if let Some(pw) = pw {
+        pw.shutdown();
+    }
+
+    result
 }
 
 #[tokio::main]
@@ -547,7 +562,13 @@ async fn main() -> Result<()> {
             let state = server::lifecycle::get_or_create_project_state(&config, &workspace)?;
             server::lifecycle::reload_config().await?;
 
-            container::run_in_container(
+            let pw = if cli.playwright {
+                Some(playwright::ensure_running(&config)?)
+            } else {
+                None
+            };
+
+            let result = container::run_in_container(
                 &rt,
                 &config,
                 &workspace,
@@ -557,7 +578,14 @@ async fn main() -> Result<()> {
                 command,
                 args,
                 interactive,
-            )?;
+                cli.playwright,
+            );
+
+            if let Some(pw) = pw {
+                pw.shutdown();
+            }
+
+            result?;
         }
         Some(Command::Commands { action }) => {
             let config = AppConfig::new()?;
