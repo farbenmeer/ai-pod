@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use regex::RegexSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use walkdir::WalkDir;
 
 use crate::config::AppConfig;
@@ -27,56 +29,48 @@ pub struct EnvFileEntry {
     pub destination: PathBuf,
 }
 
-const CREDENTIAL_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.staging",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "id_dsa",
-    ".npmrc",
-    ".pypirc",
-    ".netrc",
-    "credentials.json",
-    "service-account.json",
-    "terraform.tfstate",
-];
+/// Regexes matched against a file's *name*. `.env` and every suffixed variant
+/// (`.env.local`, `.env.dev`, `.env.whatever`) are covered by a single
+/// pattern, so projects with custom suffixes are detected without extending a
+/// literal list. Template files such as `.env.example` match too — that is
+/// intentional: the startup prompt lets the user ignore them permanently.
+static CREDENTIAL_NAME_RE: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        // .env and any suffixed variant
+        r"^\.env(\..+)?$",
+        // SSH private keys
+        r"^id_(rsa|ed25519|ecdsa|dsa)$",
+        // Package manager / network credential files
+        r"^\.(npmrc|pypirc|netrc)$",
+        // Cloud service account keys
+        r"^(credentials|service-account)\.json$",
+        // Terraform state (may embed secrets)
+        r"^terraform\.tfstate$",
+        // Key material and Terraform variable files, by extension
+        r"\.(pem|key|p12|pfx|jks|keystore|tfvars)$",
+    ])
+    .expect("credential name patterns are valid regexes")
+});
 
-const CREDENTIAL_EXTENSIONS: &[&str] = &[
-    "pem", "key", "p12", "pfx", "jks", "keystore", "tfvars",
-];
-
-const CREDENTIAL_DIR_PATTERNS: &[&str] = &[
-    ".aws/credentials",
-    ".aws/config",
-    ".ssh/",
-    ".gnupg/",
-];
+/// Regexes matched against a file's *full path*, for credentials identified by
+/// the directory they live in rather than by their own name.
+static CREDENTIAL_PATH_RE: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(^|/)\.aws/(credentials|config)$",
+        r"(^|/)\.ssh/",
+        r"(^|/)\.gnupg/",
+    ])
+    .expect("credential path patterns are valid regexes")
+});
 
 fn is_credential_file(path: &Path) -> bool {
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-
-    if CREDENTIAL_PATTERNS.iter().any(|p| file_name == *p) {
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+        && CREDENTIAL_NAME_RE.is_match(file_name)
+    {
         return true;
     }
 
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if CREDENTIAL_EXTENSIONS.iter().any(|e| ext == *e) {
-            return true;
-        }
-    }
-
-    let path_str = path.to_string_lossy();
-    if CREDENTIAL_DIR_PATTERNS.iter().any(|p| path_str.contains(p)) {
-        return true;
-    }
-
-    false
+    CREDENTIAL_PATH_RE.is_match(&path.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -149,6 +143,91 @@ mod tests_is_credential_file {
         assert!(is_credential_file(std::path::Path::new(
             "/project/service-account.json"
         )));
+    }
+
+    #[test]
+    fn arbitrary_dot_env_suffixes_are_credentials() {
+        for name in [
+            ".env.dev",
+            ".env.development",
+            ".env.test",
+            ".env.ci",
+            ".env.qa",
+            ".env.preview",
+            ".env.production.local",
+            ".env.some-custom-suffix",
+        ] {
+            let path = format!("/project/{name}");
+            assert!(
+                is_credential_file(std::path::Path::new(&path)),
+                "{name} should be detected as a credential file"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_env_templates_are_credentials_too() {
+        // Templates usually hold no real secrets, but they are still matched:
+        // the startup prompt lets the user ignore them permanently.
+        assert!(is_credential_file(std::path::Path::new(
+            "/project/.env.example"
+        )));
+        assert!(is_credential_file(std::path::Path::new(
+            "/project/.env.sample"
+        )));
+    }
+
+    #[test]
+    fn env_lookalikes_are_not_credentials() {
+        for name in ["env", "environment.ts", ".envrc", "dotenv.js", "env.example"] {
+            let path = format!("/project/{name}");
+            assert!(
+                !is_credential_file(std::path::Path::new(&path)),
+                "{name} should not be detected as a credential file"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_key_variants_are_credentials() {
+        for name in ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"] {
+            let path = format!("/project/{name}");
+            assert!(
+                is_credential_file(std::path::Path::new(&path)),
+                "{name} should be detected as a credential file"
+            );
+        }
+    }
+
+    #[test]
+    fn any_file_under_ssh_dir_is_credential() {
+        assert!(is_credential_file(std::path::Path::new(
+            "/home/user/.ssh/config"
+        )));
+    }
+
+    #[test]
+    fn npmrc_and_friends_are_credentials() {
+        for name in [".npmrc", ".pypirc", ".netrc"] {
+            let path = format!("/project/{name}");
+            assert!(
+                is_credential_file(std::path::Path::new(&path)),
+                "{name} should be detected as a credential file"
+            );
+        }
+    }
+
+    #[test]
+    fn terraform_files_are_credentials() {
+        assert!(is_credential_file(std::path::Path::new(
+            "/infra/terraform.tfstate"
+        )));
+        assert!(is_credential_file(std::path::Path::new("/infra/prod.tfvars")));
+    }
+
+    #[test]
+    fn aws_config_outside_aws_dir_is_not_credential() {
+        assert!(!is_credential_file(std::path::Path::new("/project/config")));
     }
 }
 
