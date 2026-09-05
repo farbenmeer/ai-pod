@@ -21,6 +21,7 @@ ai-pod manages per-workspace containers that run Claude Code, OpenCode, or OpenA
 - **Interactive TUIs** — `ai-pod commands` to inspect/kill running host commands, `ai-pod allowed` to manage the whitelist
 - **Desktop notifications** — Stop hooks notify you on Claude session end, an OpenCode plugin sends notifications when `session.idle` fires, and Codex's `notify` program fires on turn completion
 - **Transparent host networking** — containers reach host services at `host.containers.internal` (Podman) or `host.docker.internal` (Docker); no manual port mapping needed
+- **Browser control on the host** — `--playwright` starts Playwright MCP outside the container, so the agent drives a real, visible browser on your desktop
 - **Auto-update checks** — silently checks for new releases on startup and notifies you when one is available
 
 ---
@@ -77,6 +78,7 @@ ai-pod --workdir /path/to/project
 | `--no-cache` | Build the image without the Docker/Podman layer cache |
 | `--no-credential-check` | Skip scanning the workspace for credential files |
 | `--dry-run` | Print podman/docker commands instead of executing them |
+| `--playwright` | Start Playwright MCP on the host and wire it into the agent (see [Browser control](#browser-control-with-playwright)) |
 
 ### Subcommands
 
@@ -130,6 +132,40 @@ For OpenCode, use whichever ACP entry point it exposes (e.g. `ai-pod run opencod
 Notes:
 - Pass `--no-credential-check` (or run `ai-pod` interactively first to triage the workspace) — the credential dialog can't run without a TTY, and ai-pod will refuse to start if anything is pending.
 - `--workdir` is required when the IDE launches `ai-pod` from a directory other than the workspace root.
+
+### Browser control with Playwright
+
+```sh
+ai-pod --playwright
+```
+
+Starts `npx @playwright/mcp@latest --port 8931 --host 0.0.0.0` **on the host** and
+adds a `playwright` MCP server to whichever agent the container runs (Claude,
+OpenCode or Codex). The browser therefore runs outside the pod, on your desktop, in a headed window
+you can watch. Playwright keeps its profile between runs, so a site you log into
+once stays logged in for later sessions — the agent can click through an app
+behind your authentication instead of a fresh, empty container browser.
+
+Two details make the container -> host hop work, and ai-pod handles both:
+
+- the MCP url uses the runtime's gateway name (`host.containers.internal` for
+  Podman, `host.docker.internal` for Docker) rather than `localhost`;
+- Playwright MCP refuses requests whose `Host` header is not in its allow-list,
+  so the MCP entry sends a spoofed `Host: localhost:8931` (and the server is
+  additionally started with both gateway names in `--allowed-hosts`).
+
+Requires Node.js 18+ on the host (`npx`). The first launch downloads the package
+and can take a while; output goes to `~/.ai-pod/playwright.log`.
+
+The server is stopped again when the session that started it exits; a server
+that was already running (another session, or one you started by hand) is
+reused and left alone. Launching **without** `--playwright` removes the
+`playwright` MCP entry again, so the agent only ever sees it when you asked for
+it. An entry you added yourself pointing somewhere else is never touched.
+
+> **Note:** the Playwright MCP server binds all interfaces and has no
+> authentication — while it runs, anyone who can reach port 8931 on your machine
+> can drive your browser. Only use `--playwright` on a trusted network.
 
 ### Masking host directories
 
@@ -327,6 +363,8 @@ When a host command isn't on the allowlist, the agent's request triggers an appr
 ### Credential scanning
 
 Before mounting your workspace, ai-pod scans for common credential files (`.env`, SSH keys, API token files, etc.) and prompts you to continue or abort. Pass `--no-credential-check` to skip this if you know the workspace is clean.
+
+Detection is regex-based, so any `.env` variant is matched — `.env.local`, `.env.dev`, `.env.whatever`. Templates like `.env.example` match too; pick "keep in workspace, suppress future warnings" once and they won't be reported again for that project.
 
 ### Keeping .env files out of the container
 
