@@ -37,6 +37,65 @@ pub fn image_name(workspace: &Path) -> String {
     format!("{}-{}", label, short_hash)
 }
 
+/// Quote a string for safe inclusion in a `sh -c` command line.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The shell form of the image build, for callers that run it through the
+/// file-based command runner instead of inheriting stdio (see the
+/// `rebuild_image` MCP tool). Mirrors the arguments used by [`build_image`].
+fn build_command_string(
+    rt: &ContainerRuntime,
+    dockerfile: &Path,
+    image: &str,
+    no_cache: bool,
+) -> String {
+    let context = dockerfile.parent().unwrap_or(Path::new("."));
+    let mut parts = vec![rt.cmd().to_string(), "build".to_string()];
+    if no_cache {
+        parts.push("--no-cache".to_string());
+    }
+    // Docker build containers don't get the host gateway for free.
+    if rt.kind == crate::runtime::RuntimeKind::Docker {
+        parts.push(sh_quote(&rt.add_host_arg()));
+    }
+    parts.extend([
+        "--build-arg".to_string(),
+        sh_quote(&format!("AI_POD_VERSION={}", env!("CARGO_PKG_VERSION"))),
+        "--build-arg".to_string(),
+        sh_quote(&format!("HOST_GATEWAY={}", rt.host_gateway())),
+        "-t".to_string(),
+        sh_quote(image),
+        "-f".to_string(),
+        sh_quote(&dockerfile.to_string_lossy()),
+        sh_quote(&context.to_string_lossy()),
+    ]);
+    parts.join(" ")
+}
+
+/// Build the image, then — only if the build succeeded — run `test_command` in
+/// a throwaway container of the freshly built image so the caller can verify
+/// the tools it asked for are actually installed. The workspace is not
+/// mounted: this checks the *image*, not the project.
+pub fn rebuild_and_test_command(
+    rt: &ContainerRuntime,
+    dockerfile: &Path,
+    image: &str,
+    no_cache: bool,
+    test_command: &str,
+) -> String {
+    let build = build_command_string(rt, dockerfile, image, no_cache);
+    let test = format!(
+        "{} run --rm {} --entrypoint sh {} -c {}",
+        rt.cmd(),
+        sh_quote(&rt.add_host_arg()),
+        sh_quote(image),
+        sh_quote(test_command),
+    );
+    format!("{build} && {test}")
+}
+
 fn image_exists(rt: &ContainerRuntime, image: &str) -> Result<bool> {
     let status = rt
         .command()
@@ -186,6 +245,93 @@ mod tests {
         let a = image_name(Path::new("/alice/code/myproject"));
         let b = image_name(Path::new("/bob/code/myproject"));
         assert_ne!(a, b);
+    }
+
+    fn test_rt(kind: crate::runtime::RuntimeKind) -> ContainerRuntime {
+        ContainerRuntime {
+            kind,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quotes() {
+        assert_eq!(sh_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(sh_quote("plain"), "'plain'");
+    }
+
+    #[test]
+    fn rebuild_command_builds_then_tests_the_fresh_image() {
+        use crate::runtime::RuntimeKind;
+        let cmd = rebuild_and_test_command(
+            &test_rt(RuntimeKind::Podman),
+            Path::new("/ws/ai-pod.Dockerfile"),
+            "ws-abc123",
+            false,
+            "node --version",
+        );
+        let (build, test) = cmd.split_once(" && ").expect("build must gate the test");
+        assert!(build.starts_with("podman build "));
+        assert!(build.contains("-t 'ws-abc123'"));
+        assert!(build.contains("-f '/ws/ai-pod.Dockerfile'"));
+        // Build context is the Dockerfile's directory.
+        assert!(
+            build.ends_with(" '/ws'"),
+            "unexpected build context: {build}"
+        );
+        assert!(build.contains("--build-arg 'HOST_GATEWAY=host.containers.internal'"));
+        assert!(build.contains(&format!(
+            "--build-arg 'AI_POD_VERSION={}'",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(!build.contains("--no-cache"));
+        // Throwaway container, no workspace mount, test command quoted as one arg.
+        assert!(test.starts_with("podman run --rm "));
+        assert!(test.contains("--entrypoint sh 'ws-abc123' -c 'node --version'"));
+        assert!(!test.contains("-v "));
+    }
+
+    #[test]
+    fn rebuild_command_honours_no_cache() {
+        use crate::runtime::RuntimeKind;
+        let cmd = rebuild_and_test_command(
+            &test_rt(RuntimeKind::Podman),
+            Path::new("/ws/ai-pod.Dockerfile"),
+            "img",
+            true,
+            "true",
+        );
+        assert!(cmd.contains("podman build --no-cache "));
+    }
+
+    #[test]
+    fn rebuild_command_adds_host_gateway_for_docker_builds() {
+        use crate::runtime::RuntimeKind;
+        let cmd = rebuild_and_test_command(
+            &test_rt(RuntimeKind::Docker),
+            Path::new("/ws/ai-pod.Dockerfile"),
+            "img",
+            false,
+            "true",
+        );
+        assert!(cmd.contains("docker build '--add-host=host.docker.internal:host-gateway'"));
+    }
+
+    #[test]
+    fn rebuild_command_quotes_a_hostile_test_command() {
+        use crate::runtime::RuntimeKind;
+        let cmd = rebuild_and_test_command(
+            &test_rt(RuntimeKind::Podman),
+            Path::new("/ws/ai-pod.Dockerfile"),
+            "img",
+            false,
+            "echo hi'; rm -rf /tmp/x; echo '",
+        );
+        // The injected shell metacharacters stay inside a single quoted argument.
+        assert!(
+            cmd.ends_with(r#"-c 'echo hi'\''; rm -rf /tmp/x; echo '\'''"#),
+            "got: {cmd}"
+        );
     }
 
     #[test]

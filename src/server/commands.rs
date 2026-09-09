@@ -341,6 +341,53 @@ pub async fn run_service_request(
     }
 }
 
+/// Canonical string that identifies a `rebuild_image` request for approval
+/// purposes. The test command is deliberately *not* part of the key: it runs
+/// inside a throwaway container of the freshly built image, so the thing the
+/// user is really approving is "this workspace's agent may rebuild its own
+/// image from its Dockerfile".
+pub fn rebuild_approval_key(image: &str) -> String {
+    format!(
+        "rebuild image {} from {}",
+        image,
+        crate::image::DOCKERFILE_NAME
+    )
+}
+
+/// Approve (or pre-approve) an image-rebuild request. Mirrors
+/// `run_service_request` but consults `allowed_rebuilds`.
+pub async fn run_rebuild_request(
+    state: &AppState,
+    image: &str,
+    workspace: &Path,
+) -> ApprovalOutcome {
+    let key = rebuild_approval_key(image);
+    let hash = workspace_hash(workspace);
+    let state_file = state.config_dir.join(format!("{}.json", hash));
+    let ps = ProjectState::load(&state_file);
+    if ps.is_rebuild_allowed(&key) {
+        return ApprovalOutcome::Approved;
+    }
+
+    let project_name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let body = format!("Rebuild container image:\n{}", key);
+    match request_approval_with_body(state, body, &key, &project_name).await {
+        ApprovalDecision::AllowOnce => ApprovalOutcome::Approved,
+        ApprovalDecision::AlwaysAllow => {
+            let mut ps = ProjectState::load(&state_file);
+            ps.add_allowed_rebuild(&key);
+            let _ = ps.save(&state_file);
+            ApprovalOutcome::AlwaysAllow
+        }
+        ApprovalDecision::Deny(reason) => ApprovalOutcome::Denied(reason),
+        ApprovalDecision::PermissionTimeout => ApprovalOutcome::Timeout,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +448,38 @@ mod tests {
         assert_eq!(args[2], "--");
         assert_eq!(args[3], "-e malicious_script");
         assert_eq!(args[4], "--version");
+    }
+
+    #[test]
+    fn rebuild_key_names_the_image_and_dockerfile() {
+        let key = rebuild_approval_key("myproject-12aef3");
+        assert!(key.contains("myproject-12aef3"));
+        assert!(key.contains("ai-pod.Dockerfile"));
+    }
+
+    #[test]
+    fn rebuild_key_is_independent_of_the_test_command() {
+        // The key is what lands in the allowlist; it must stay stable so the
+        // agent can iterate on its Dockerfile without re-prompting per test.
+        assert_eq!(rebuild_approval_key("img"), rebuild_approval_key("img"));
+        assert_ne!(rebuild_approval_key("img"), rebuild_approval_key("other"));
+    }
+
+    #[test]
+    fn rebuild_allowlist_round_trips_through_project_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let key = rebuild_approval_key("img");
+        let mut ps = ProjectState::default();
+        assert!(!ps.is_rebuild_allowed(&key));
+        ps.add_allowed_rebuild(&key);
+        ps.add_allowed_rebuild(&key);
+        ps.save(&path).unwrap();
+        let loaded = ProjectState::load(&path);
+        assert_eq!(loaded.allowed_rebuilds, vec![key.clone()]);
+        assert!(loaded.is_rebuild_allowed(&key));
+        // Rebuild approval is its own bucket — it must not leak into commands.
+        assert!(!loaded.is_allowed(&key));
     }
 
     #[test]

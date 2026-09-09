@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod services_cli;
+pub mod skill;
 pub mod update;
 pub mod workspace;
 
